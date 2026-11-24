@@ -938,6 +938,17 @@ namespace
     constexpr size_t kPrivateMetalSiteCount = 5;
     constexpr size_t kPrivateMediaSiteCount = arrsize(kPrivateMediaSites) - kPrivateMetalSiteCount;
 
+    bool isPrivateMetalPage(const char* const vnodeName, const UInt64 pageOffset)
+    {
+        if (strcmp(vnodeName, "dyld_shared_cache_x86_64h.03") != 0) { return false; }
+
+        for (size_t i = kPrivateMediaSiteCount; i < arrsize(kPrivateMediaSites); ++i) {
+            const UInt64 fileOffset = kPrivateMediaSites[i].offset - kRaven2VAOffset;
+            if ((fileOffset & ~static_cast<UInt64>(PAGE_SIZE - 1)) == pageOffset) { return true; }
+        }
+        return false;
+    }
+
     constexpr size_t kPrivateMediaPageCount = [] {
         size_t count = 0;
         UInt64 previous = 0;
@@ -1276,6 +1287,7 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     const bool isAppleGVA    = (strstr(vnodeName, "AppleGVA") != nullptr);
     const bool isSharedCache = (strstr(vnodeName, "dyld_shared_cache") != nullptr) ||
                                (strstr(vnodeName, "dyld") != nullptr);
+    const bool privateMetalPage = this->usesPrivateMetal() && isPrivateMetalPage(vnodeName, pageOffset);
     vnode_putname(vnodeName);
 
     VnodeKind vnodeKind = kVnodeNone;
@@ -1295,7 +1307,7 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
 
     // O(1) fast path for previously discovered sites whose clean UBC pages were evicted under
     // memory pressure and re-faulted from disk. Must run before the `allApplied` early-outs.
-    this->reapplyCachedSites(vnodeKind, pageOffset, bytes);
+    if (!privateMetalPage) { this->reapplyCachedSites(vnodeKind, pageOffset, bytes); }
 
     // VDA Dynamic Resolver path (AMDRadeonVADriver2: embedded in dyld_shared_cache or loose bundle)
     // Note: _cs_validate_page is invoked by XNU only once per physical page when the page enters the
@@ -1413,7 +1425,7 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
                 NRed::singleton().setProp32("NRedGLResolverApplied", glCount);
             }
         }
-    } else if (isSharedCache && !this->usesPrivateMetal()) {
+    } else if (isSharedCache && !privateMetalPage) {
         // Gate 2.5: Metal HwInfo patch in dyld shared cache.
         // AMDRadeonX5000MTLDriver lives inside dyld shared cache. We must patch
         // gfx9_HwInfoInitData so numShaderEngines is 1 instead of 4, preventing

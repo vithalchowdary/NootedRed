@@ -558,7 +558,7 @@ namespace
     // (Raven2 segment 1 base 0x7E00 + VCN1 register offset).
     // =========================================================================
 
-    // writeUvdGpcomVcpuData0/Data1/Cmd:
+    // writeUvdGpcomVcpuData0/Data1/Cmd have separate long and short prologues:
     //   macOS 13:     55 48 89 E5 41 56 53 [41 89 F6 48 89 FB] 48 8B 07 BE <reg> 00 00 FF 50 20
     //   macOS 14-26:  55 48 89 E5 41 56 53 [89 F3 49 89 FE]    48 8B 07 BE <reg> 00 00 FF 50 20
     static const UInt8 kVcn1Mask_GpcomReg[] = {
@@ -590,6 +590,24 @@ namespace
     };
     static const UInt8 kVcn1Find_Cmd[]    = {0x03, 0x05, 0x00, 0x00};
     static const UInt8 kVcn1Replace_Cmd[] = {0xC3, 0x81, 0x00, 0x00};
+
+    static const UInt8 kVcn1Mask_GpcomRegShort[] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+
+    static const UInt8 kVcn1Ctx_Data0Short[] = {
+        0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x8B, 0x07, 0xBE, 0x04, 0x05, 0x00, 0x00, 0xFF, 0x50, 0x20,
+    };
+    static const UInt8 kVcn1Ctx_Data1Short[] = {
+        0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x8B, 0x07, 0xBE, 0x05, 0x05, 0x00, 0x00, 0xFF, 0x50, 0x20,
+    };
+    static const UInt8 kVcn1Ctx_CmdShort[] = {
+        0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x8B, 0x07, 0xBE, 0x03, 0x05, 0x00, 0x00, 0xFF, 0x50, 0x20,
+    };
 
     // writeUvdEngineStart / writeUvdNoOp (identical across macOS 13-26)
     static const UInt8 kVcn1Mask_UvdCtrl[] = {
@@ -627,6 +645,15 @@ namespace
         {kVcn1Ctx_NoOp, kVcn1Mask_UvdCtrl, sizeof(kVcn1Ctx_NoOp), 13,
          kVcn1Replace_NoOp, sizeof(kVcn1Replace_NoOp), 0, 2, ~0ULL,
          kVcn1Find_NoOp, sizeof(kVcn1Find_NoOp)},
+        {kVcn1Ctx_Data0Short, kVcn1Mask_GpcomRegShort, sizeof(kVcn1Ctx_Data0Short), 16,
+         kVcn1Replace_Data0, sizeof(kVcn1Replace_Data0), 0, 2, ~0ULL,
+         kVcn1Find_Data0, sizeof(kVcn1Find_Data0)},
+        {kVcn1Ctx_Data1Short, kVcn1Mask_GpcomRegShort, sizeof(kVcn1Ctx_Data1Short), 16,
+         kVcn1Replace_Data1, sizeof(kVcn1Replace_Data1), 0, 2, ~0ULL,
+         kVcn1Find_Data1, sizeof(kVcn1Find_Data1)},
+        {kVcn1Ctx_CmdShort, kVcn1Mask_GpcomRegShort, sizeof(kVcn1Ctx_CmdShort), 16,
+         kVcn1Replace_Cmd, sizeof(kVcn1Replace_Cmd), 0, 2, ~0ULL,
+         kVcn1Find_Cmd, sizeof(kVcn1Find_Cmd)},
     };
     constexpr size_t kVcn1DecodeRegisterSignatureCount = arrsize(kVcn1DecodeRegisterSignatures);
 }
