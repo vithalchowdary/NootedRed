@@ -57,7 +57,29 @@ namespace
 
     const char* const kBootArgNoVDA = "-NRedNoVDA";
 
+    volatile SInt32 previewTraceSequence{0};
 
+    UInt32 beginPreviewTrace(const char* const operation)
+    {
+        if (!UserPatches::singleton().usesPrivateMedia()) { return 0; }
+        const auto sequence = static_cast<UInt32>(OSIncrementAtomic(&previewTraceSequence)) + 1;
+        SYSLOG("VCN", "Raven2 preview trace %u %s enter", sequence, operation);
+        return sequence;
+    }
+
+    void endPreviewTrace(const UInt32 sequence, const char* const operation, const UInt32 result)
+    {
+        if (sequence != 0) {
+            SYSLOG("VCN", "Raven2 preview trace %u %s return 0x%x", sequence, operation, result);
+        }
+    }
+
+    void traceNativeContextEntry(const UInt32 sequence, const char* const operation)
+    {
+        if (sequence != 0) {
+            SYSLOG("VCN", "Raven2 preview trace %u %s native enter", sequence, operation);
+        }
+    }
     // VCN bridge supports macOS 13 through 26 (Darwin 22 - 25).
     // Version-specific ABI stability is guarded dynamically by verifyKernelABI() vtable checks.
     bool isSupportedOS()
@@ -486,7 +508,9 @@ void VCNBridge::clientStop(void* const self, void* const provider)
 {
     auto& bridge = singleton();
     const auto address = bridge.engineEnabled() ? bridge.clientStop5000 : bridge.orgClientStop;
+    const auto trace = beginPreviewTrace("clientStop");
     reinterpret_cast<void (*)(void*, void*)>(address)(self, provider);
+    endPreviewTrace(trace, "clientStop", 0);
 }
 
 UInt64 VCNBridge::surfaceCopy(void* const self, void* const input, const UInt64 size, void* const event)
@@ -548,6 +572,71 @@ bool VCNBridge::fetchResource(void* const self, void* const parameters, void* co
     return ok;
 }
 
+static bool preparePrivateMediaContext(const void* createInfo, const void* returnInfo)
+{
+    if (createInfo == nullptr || returnInfo == nullptr) { return true; }
+    if (UserPatches::singleton().prepareRaven2MediaPages()) { return true; }
+    NRed::singleton().setProp32("NRedRaven2PrivateCacheRejected", 1);
+    return false;
+}
+
+IOReturn VCNBridge::createVcnContext(void* const self, void* const createInfo, void* const returnInfo)
+{
+    const auto trace = beginPreviewTrace("createVcnContext");
+    if (!preparePrivateMediaContext(createInfo, returnInfo)) {
+        endPreviewTrace(trace, "createVcnContext map rejected", kIOReturnUnsupported);
+        return kIOReturnUnsupported;
+    }
+    traceNativeContextEntry(trace, "createVcnContext");
+    const auto result = FunctionCast(createVcnContext, singleton().orgCreateVcnContext)(self, createInfo, returnInfo);
+    endPreviewTrace(trace, "createVcnContext", result);
+    return result;
+}
+
+IOReturn VCNBridge::newVcnContext(void* const self, void* const createInfo, void* const returnInfo,
+                                  const UInt64 event, UInt64* const contextId)
+{
+    const auto trace = beginPreviewTrace("newVcnContext");
+    if (!preparePrivateMediaContext(createInfo, returnInfo)) {
+        endPreviewTrace(trace, "newVcnContext map rejected", kIOReturnUnsupported);
+        return kIOReturnUnsupported;
+    }
+    traceNativeContextEntry(trace, "newVcnContext");
+    const auto result = FunctionCast(newVcnContext, singleton().orgNewVcnContext)(self, createInfo, returnInfo,
+                                                                                event, contextId);
+    endPreviewTrace(trace, "newVcnContext", result);
+    return result;
+}
+
+IOReturn VCNBridge::removeVcnContext(void* const self, const UInt32 contextId)
+{
+    const auto trace = beginPreviewTrace("RemoveVcnContext");
+    SYSLOG("VCN", "Raven2 preview trace %u removing context %u", trace, contextId);
+    const auto result = FunctionCast(removeVcnContext, singleton().orgRemoveVcnContext)(self, contextId);
+    endPreviewTrace(trace, "RemoveVcnContext", result);
+    return result;
+}
+
+IOReturn VCNBridge::commitDecodeBuffer(void* const self, void* const submitInfo)
+{
+    const auto original = FunctionCast(commitDecodeBuffer, singleton().orgCommitDecodeBuffer);
+    if (submitInfo == nullptr) { return original(self, submitInfo); }
+
+    static volatile SInt32 commits{0};
+    const auto ordinal = static_cast<UInt32>(OSIncrementAtomic(&commits)) + 1;
+    if (ordinal != 1 && (ordinal % 128) != 0) { return original(self, submitInfo); }
+
+    // On 24H241 the native method reads this word and submits it as the decode fence value.
+    constexpr size_t kStampOffset = 0x18;
+    UInt32 stamp;
+    memcpy(&stamp, static_cast<const UInt8*>(submitInfo) + kStampOffset, sizeof(stamp));
+    const auto trace = beginPreviewTrace("decode IB commit");
+    SYSLOG("VCN", "Raven2 preview trace %u decode IB commit #%u stamp=%u", trace, ordinal, stamp);
+    const auto result = original(self, submitInfo);
+    endPreviewTrace(trace, "decode IB commit", result);
+    return result;
+}
+
 bool VCNBridge::initVCNContext(void* const self, void* const accelerator, void* const context,
                               void* const createInfo)
 {
@@ -558,7 +647,8 @@ bool VCNBridge::initVCNContext(void* const self, void* const accelerator, void* 
     // type 5 is AV1 (unsupported on VCN1), type 6/7 are AVC/HEVC encode.
     UInt32 type;
     memcpy(&type, static_cast<const UInt8*>(createInfo) + sizeof(UInt32), sizeof(type));
-    if (type == 5) { return false; }
+    const auto& userPatches = UserPatches::singleton();
+    if (type == 5 || (userPatches.usesPrivateMedia() && !userPatches.raven2MediaPagesReady())) { return false; }
 
     if (type == 6 || type == 7) {
         const bool hevc = type == 7;
@@ -820,8 +910,13 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
              this->orgInitHardware},
             {"__ZN33AMDRadeonX6000_AMDAccelVCNContext4initEP37AMDRadeonX6000_AMDGraphicsAcceleratorP35AMDRadeonX6000_AMDAccelVideoContextP23sVideoContextCreateInfo",
              initVCNContext, this->orgInitVCNContext},
+            {"__ZN29AMDRadeonX6000_AMDAccelShared16CreateVcnContextEP23sVideoContextCreateInfoP23sVideoContextReturnInfo",
+             createVcnContext, this->orgCreateVcnContext},
+            {"__ZN36AMDRadeonX6000_AMDNavi10VideoContext10newContextEP23sVideoContextCreateInfoP23sVideoContextReturnInfoyPy",
+             newVcnContext, this->orgNewVcnContext},
         };
-        const size_t routeCount = arrsize(routes) - (VDA::singleton().isVcn1Mode() ? 0 : 1);
+        const size_t routeCount = arrsize(routes) - (UserPatches::singleton().usesPrivateMedia() ? 0
+            : (VDA::singleton().isVcn1Mode() ? 2 : 3));
         if (!patcher.routeMultiple(id, routes, routeCount, slide, size)) {
             patcher.clearError();
             if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
@@ -854,6 +949,22 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
             "__ZN35AMDRadeonX6000_AMDAccelVideoContext14processCommandEPj16VideoCommandTypeS0_j",
             "__ZN35AMDRadeonX6000_AMDAccelVideoContext13fetchResourceEP22_AMDVideoResourceParamP21_AMDVideoResourceInfo",
             "NRedX6000VideoCommandGuarded");
+
+        if (UserPatches::singleton().usesPrivateMedia()) {
+            KernelPatcher::RouteRequest traceRoutes[] = {
+                {"__ZN32AMDRadeonX6000_AMDVCN2DecChannel27commitIndirectCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
+                 commitDecodeBuffer, this->orgCommitDecodeBuffer},
+                {"__ZN29AMDRadeonX6000_AMDAccelShared16RemoveVcnContextEj",
+                 removeVcnContext, this->orgRemoveVcnContext},
+            };
+            const char* const properties[] = {"NRedRaven2DecodeCommitTrace", "NRedRaven2RemoveContextTrace"};
+            static_assert(arrsize(traceRoutes) == arrsize(properties));
+            for (size_t i = 0; i < arrsize(traceRoutes); ++i) {
+                const bool installed = patcher.routeMultiple(id, &traceRoutes[i], 1, slide, size);
+                if (!installed) { patcher.clearError(); }
+                NRed::singleton().setProp32(properties[i], installed ? 1 : 0);
+            }
+        }
 
         this->x6000Prepared = true;
         NRed::singleton().setProp32("NRedVCNX6000ABIValidated", 1);

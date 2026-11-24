@@ -27,6 +27,7 @@
 #include <GLResourceBudgetPatch.hpp>
 #include <NRed.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
+#include <UserPatchMemory.hpp>
 #include <UserPatches.hpp>
 #include <VDA.hpp>
 #include <VCNBridge.hpp>
@@ -36,9 +37,12 @@
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOUserClient.h>
 #include <libkern/c++/OSBoolean.h>
+#include <sys/proc.h>
 #include <sys/vnode.h>
 
 extern "C" vm_map_t current_map(void);
+extern "C" char osversion[];
+extern "C" const char version[];
 
 static UserPatches moduleInstance;
 
@@ -520,7 +524,17 @@ void UserPatches::processPatcher(KernelPatcher& patcher)
             return;
         }
 
+        const auto apu = this->currentApuMask();
+        this->privateMedia = this->vdaEnabled && VDA::singleton().isVcn1Mode()
+            && (apu & (kApuRaven2 | kApuPicasso)) != 0
+            && getKernelVersion() == KernelVersion::Sequoia
+            && (strcmp(osversion, "24H241") == 0
+                || (osversion[0] == '\0' && strstr(version, "xnu-11417.140.69.713.47~2/RELEASE_X86_64")));
         this->nativeBackendReady = this->installNativePagePatcher(patcher);
+        if (this->privateMedia && this->nativeBackendReady) {
+            this->nativeBackendReady = this->installRaven2PrivatePatcher(patcher);
+            SYSLOG_COND(!this->nativeBackendReady, "UserPatch", "Failed to install Sequoia private media patcher");
+        }
         SYSLOG_COND(!this->nativeBackendReady, "UserPatch",
                     "Failed to install the dynamic signature patch backend");
         return;
@@ -862,6 +876,387 @@ void UserPatches::applyVdaSignatureList(const VnodeKind vnodeKind, const UInt64 
     }
 }
 
+namespace
+{
+    // Sonoma and other Sequoia builds keep their existing policy. These offsets
+    // are tied to the three x86_64h cache UUIDs of Sequoia 24H241.
+    constexpr UInt64 kRaven2GVAOffset = 0x200000000;
+    constexpr UInt64 kRaven2VAOffset = 0x300000000;
+    constexpr UInt8 kRaven2CacheUUID[] = {0x0F, 0xAE, 0xE1, 0xE1, 0x7A, 0x09, 0x3A, 0x16,
+                                         0x92, 0x2E, 0xD6, 0xE1, 0x66, 0x3C, 0x71, 0x5F};
+    constexpr UInt8 kRaven2GVAUUID[] = {0xF5, 0xE3, 0x93, 0x81, 0xCF, 0xD4, 0x34, 0x34,
+                                       0xB7, 0x28, 0xB7, 0x93, 0xC9, 0x68, 0x8A, 0xDA};
+    constexpr UInt8 kRaven2VAUUID[] = {0xCB, 0x0A, 0xBD, 0xD0, 0x02, 0x3F, 0x32, 0x29,
+                                      0xAD, 0xED, 0x4F, 0xC7, 0x0C, 0x22, 0xBD, 0xA9};
+
+    struct PrivateMediaSite
+    {
+        // Keep each site at 24 bytes. Growing __DATA to the next page boundary
+        // can make the linker add a file gap that OpenCore 1.0.8 cannot expand.
+        UInt64 offset : 48;
+        UInt64 size : 16;
+        const UInt8* original;
+        const UInt8* replacement;
+    };
+    static_assert(sizeof(PrivateMediaSite) == 24);
+
+    template <size_t Size>
+    constexpr PrivateMediaSite privateSite(UInt64 offset, const UInt8 (&original)[Size],
+                                           const UInt8 (&replacement)[Size])
+    {
+        static_assert(Size <= PAGE_SIZE);
+        return {offset, Size, original, replacement};
+    }
+
+    // 24H241 Raven2/Picasso decode uses the same patch families as the
+    // 23J631 decode-only transaction. Keep native decoder capability checks.
+    constexpr PrivateMediaSite kPrivateMediaSites[] = {
+        privateSite(kRaven2GVAOffset + 0x0669641B, kGVAFind_Sequoia, kGVAReplace_Sequoia),
+        privateSite(kRaven2VAOffset + 0x08606B96, kVDAFind_Identify, kVDAReplace_Identify),
+        privateSite(kRaven2VAOffset + 0x08608449, kVDAFind_AddrLibInit, kVDAReplace_AddrLibInit),
+        privateSite(kRaven2VAOffset + 0x0860F987, kVDAFind_VideoProcessors, kVDAReplace_VideoProcessors),
+        privateSite(kRaven2VAOffset + 0x0860FA49, kVDAFind_VideoProcessors, kVDAReplace_VideoProcessors),
+        privateSite(kRaven2VAOffset + 0x0860FACB, kVDAFind_VideoProcessors, kVDAReplace_VideoProcessors),
+        privateSite(kRaven2VAOffset + 0x0860FBD0, kVDAFind_EngineAndBlt, kVDAReplace_EngineAndBlt),
+        privateSite(kRaven2VAOffset + 0x0860FC69, kVDAFind_EngineAndBlt, kVDAReplace_EngineAndBlt),
+        // Validate all five decode register operands before applying the private-cache transaction.
+        privateSite(kRaven2VAOffset + 0x0864C33C, kVcn1Find_Data0, kVcn1Replace_Data0),
+        privateSite(kRaven2VAOffset + 0x0864C366, kVcn1Find_Data1, kVcn1Replace_Data1),
+        privateSite(kRaven2VAOffset + 0x0864C390, kVcn1Find_Cmd, kVcn1Replace_Cmd),
+        privateSite(kRaven2VAOffset + 0x0864C3B9, kVcn1Find_EngineStart, kVcn1Replace_EngineStart),
+        privateSite(kRaven2VAOffset + 0x0864C3E5, kVcn1Find_NoOp, kVcn1Replace_NoOp),
+        privateSite(kRaven2VAOffset + 0x08667C65, kVDAFind_AddrLibCreate, kVDAReplace_AddrLibCreate),
+        privateSite(kRaven2VAOffset + 0x0867D770, kVDAFind_ConvertFamily, kVDAReplace_ConvertFamily),
+        // AMDRadeonX5000MTLDriver is in the same signed subcache on 24H241.
+        // Keep the existing blend and GFX9 shader-engine corrections in each task's map.
+        privateSite(kRaven2VAOffset + 0x087B3164, kMTLGateFind, kMTLGateReplace),
+        privateSite(kRaven2VAOffset + 0x087B3198, kMTLAllowFind_Sequoia, kMTLAllowReplace_Sequoia),
+        privateSite(kRaven2VAOffset + 0x087EF51D, kGLDriverHwInfoFind, kGLDriverHwInfoReplace),
+        privateSite(kRaven2VAOffset + 0x087EF568, kGLDriverHwInfoFind, kGLDriverHwInfoReplace),
+        privateSite(kRaven2VAOffset + 0x087EF5A5, kGLDriverHwInfoFind, kGLDriverHwInfoReplace),
+    };
+    constexpr size_t kPrivateMetalSiteCount = 5;
+    constexpr size_t kPrivateMediaSiteCount = arrsize(kPrivateMediaSites) - kPrivateMetalSiteCount;
+
+    constexpr size_t kPrivateMediaPageCount = [] {
+        size_t count = 0;
+        UInt64 previous = 0;
+        for (const auto& site : kPrivateMediaSites) {
+            const auto page = site.offset & ~static_cast<UInt64>(PAGE_SIZE - 1);
+            if (page != previous) { ++count; }
+            previous = page;
+        }
+        return count;
+    }();
+    static_assert([] {
+        UInt64 end = 0;
+        for (const auto& site : kPrivateMediaSites) {
+            if (site.offset < end || (site.offset % PAGE_SIZE) + site.size > PAGE_SIZE) { return false; }
+            end = site.offset + site.size;
+        }
+        return true;
+    }());
+
+    struct Raven2PrivatePage
+    {
+        UserPatchMemory::Page vm;
+        vm_prot_t maximum;
+        UInt8 original[PAGE_SIZE];
+        UInt8 patched[PAGE_SIZE];
+        bool writeAttempted;
+    };
+
+    struct Raven2MapState
+    {
+        vm_map_t map;
+        vm_map_t readyMap;
+    };
+
+    struct Raven2SharedRegionArgs { user_addr_t startAddress; };
+    using Raven2SharedRegionCheck = int (*)(proc_t, Raven2SharedRegionArgs*, int*);
+    using Raven2MapDestroy = void (*)(vm_map_t);
+    using Raven2GetTaskMap = vm_map_t (*)(task_t);
+    using Raven2CopyIn = int (*)(user_addr_t, void*, size_t);
+    using Raven2CopyOut = int (*)(const void*, user_addr_t, size_t);
+
+    static Raven2SharedRegionCheck raven2OriginalSharedRegionCheck{nullptr};
+    static Raven2MapDestroy raven2OriginalMapDestroy{nullptr};
+    static Raven2GetTaskMap raven2GetTaskMap{nullptr};
+    static Raven2CopyIn raven2CopyIn{nullptr};
+    static Raven2CopyOut raven2CopyOut{nullptr};
+    static UserPatchMemory::RegionQuery raven2QueryRegion{nullptr};
+    static IOLock* raven2MapLock{nullptr};
+    static Raven2MapState raven2Maps[1024]{};
+    static UInt64 raven2VerifiedCacheBase{0};
+
+    void reportRaven2VMError(const kern_return_t result)
+    {
+        NRed::singleton().setProp32("NRedRaven2PrivateVMError", static_cast<UInt32>(result));
+    }
+
+    vm_map_t raven2CurrentMap()
+    {
+        const auto map = current_map();
+        return map != nullptr && raven2GetTaskMap(current_task()) == map ? map : nullptr;
+    }
+
+    bool matchesRaven2Cache(const UInt64 address, const UInt8 (&uuid)[16])
+    {
+        UInt8 header[0x68];
+        return raven2CopyIn(address, header, sizeof(header)) == 0
+            && memcmp(header, "dyld_v1 ", 8) == 0
+            && memcmp(header + 0x58, uuid, sizeof(uuid)) == 0;
+    }
+
+    bool restoreRaven2Page(vm_map_t map, Raven2PrivatePage& entry)
+    {
+        auto& page = entry.vm;
+        if (!page.writable && !page.maximumPending) { return true; }
+
+        // Restore the task's original maximum, which can differ from its current RX protection.
+        if (page.writable) {
+            auto result = vm_protect(map, page.address, PAGE_SIZE, FALSE, page.protection);
+            if (result != KERN_SUCCESS) {
+                reportRaven2VMError(result);
+                result = vm_protect(map, page.address, PAGE_SIZE, FALSE, page.protection);
+            }
+            if (result != KERN_SUCCESS) {
+                reportRaven2VMError(result);
+                return false;
+            }
+            page.writable = false;
+            page.maximumPending = true;
+        }
+
+        const auto result = vm_protect(map, page.address, PAGE_SIZE, TRUE, entry.maximum);
+        if (result != KERN_SUCCESS) {
+            reportRaven2VMError(result);
+            return false;
+        }
+        page.maximumPending = false;
+        return true;
+    }
+
+    bool applyRaven2PrivatePages(const vm_map_t map, Raven2PrivatePage* const pages, const size_t count)
+    {
+        for (size_t i = 0; i < count; ++i) {
+            auto& page = pages[i];
+            if (memcmp(page.original, page.patched, PAGE_SIZE) == 0) { continue; }
+            const auto changed = UserPatchMemory::makeWritable(map, page.vm, reportRaven2VMError);
+            if (!changed) { return false; }
+            page.writeAttempted = true;
+            if (raven2CopyOut(page.patched, page.vm.address, PAGE_SIZE) != 0) { return false; }
+        }
+
+        // Publish admission only after every modified page has returned to executable protection.
+        for (size_t i = 0; i < count; ++i) {
+            if (!restoreRaven2Page(map, pages[i])) { return false; }
+        }
+        return true;
+    }
+
+    bool restoreRaven2OriginalPages(const vm_map_t map, Raven2PrivatePage* const pages, const size_t count)
+    {
+        bool restored = true;
+        for (size_t i = 0; i < count; ++i) {
+            auto& page = pages[i];
+            if (page.writeAttempted &&
+                (!UserPatchMemory::makeWritable(map, page.vm, reportRaven2VMError)
+                 || raven2CopyOut(page.original, page.vm.address, PAGE_SIZE) != 0)) {
+                restored = false;
+            }
+            if (!restoreRaven2Page(map, page)) { restored = false; }
+        }
+        return restored;
+    }
+
+    enum class Raven2PatchResult { Ready, Rejected, RestoreFailed };
+
+    Raven2PatchResult patchRaven2PrivateCache(const vm_map_t map, const UInt64 base, const bool verifyOnly = false)
+    {
+        if (base == 0 || base >= (1ULL << 47) - kRaven2VAOffset - 0x9000000
+            || !matchesRaven2Cache(base, kRaven2CacheUUID)
+            || !matchesRaven2Cache(base + kRaven2GVAOffset, kRaven2GVAUUID)
+            || !matchesRaven2Cache(base + kRaven2VAOffset, kRaven2VAUUID)) {
+            return Raven2PatchResult::Rejected;
+        }
+
+        auto* const pages = IONewZero(Raven2PrivatePage, kPrivateMediaPageCount);
+        if (pages == nullptr) { return Raven2PatchResult::Rejected; }
+
+        size_t count = 0;
+        bool valid = true;
+        const bool privateMetal = UserPatches::singleton().usesPrivateMetal();
+        const size_t siteCount = privateMetal ? arrsize(kPrivateMediaSites) : kPrivateMediaSiteCount;
+        for (size_t index = 0; index < siteCount; ++index) {
+            const auto& site = kPrivateMediaSites[index];
+            const auto address = base + site.offset;
+            const auto pageAddress = address & ~static_cast<UInt64>(PAGE_SIZE - 1);
+            const size_t inPage = address - pageAddress;
+            if (count == 0 || pages[count - 1].vm.address != pageAddress) {
+                auto& page = pages[count++];
+                page.vm.address = pageAddress;
+                auto& protection = page.vm.protection;
+                if (!UserPatchMemory::leafProtection(map, pageAddress, protection, raven2QueryRegion,
+                                                     reportRaven2VMError, &page.maximum)
+                    || protection != (VM_PROT_READ | VM_PROT_EXECUTE)
+                    || raven2CopyIn(pageAddress, page.original, PAGE_SIZE) != 0) {
+                    valid = false;
+                    break;
+                }
+                memcpy(page.patched, page.original, PAGE_SIZE);
+            }
+
+            auto* const bytes = pages[count - 1].patched + inPage;
+            if (verifyOnly) {
+                valid = memcmp(bytes, site.replacement, site.size) == 0;
+            } else {
+                valid = memcmp(bytes, site.original, site.size) == 0;
+                if (valid) { memcpy(bytes, site.replacement, site.size); }
+            }
+            if (!valid) { break; }
+        }
+
+        auto result = Raven2PatchResult::Rejected;
+        if (valid) {
+            if (verifyOnly || applyRaven2PrivatePages(map, pages, count)) {
+                result = Raven2PatchResult::Ready;
+            } else if (!restoreRaven2OriginalPages(map, pages, count)) {
+                result = Raven2PatchResult::RestoreFailed;
+            }
+        }
+        IODelete(pages, Raven2PrivatePage, kPrivateMediaPageCount);
+        return result;
+    }
+
+    Raven2MapState* reserveRaven2Map(const vm_map_t map)
+    {
+        IOLockLock(raven2MapLock);
+        Raven2MapState* empty = nullptr;
+        for (auto& state : raven2Maps) {
+            if (state.map == map) {
+                IOLockUnlock(raven2MapLock);
+                return nullptr;
+            }
+            if (empty == nullptr && state.map == nullptr) { empty = &state; }
+        }
+        if (empty != nullptr) { empty->map = map; }
+        IOLockUnlock(raven2MapLock);
+        return empty;
+    }
+
+    void finishRaven2Map(Raven2MapState& state, bool ready)
+    {
+        IOLockLock(raven2MapLock);
+        if (ready) {
+            __atomic_store_n(&state.readyMap, state.map, __ATOMIC_RELEASE);
+        } else {
+            state.map = nullptr;
+        }
+        IOLockUnlock(raven2MapLock);
+    }
+
+    int wrapRaven2SharedRegionCheck(const proc_t process, Raven2SharedRegionArgs* const args, int* const retval)
+    {
+        const auto result = raven2OriginalSharedRegionCheck(process, args, retval);
+        if (result != 0 || args == nullptr) { return result; }
+        const auto map = raven2CurrentMap();
+        UInt64 base;
+        if (map == nullptr || raven2CopyIn(args->startAddress, &base, sizeof(base)) != 0) { return result; }
+
+        auto* const state = reserveRaven2Map(map);
+        if (state == nullptr) { return result; }
+        const auto patched = patchRaven2PrivateCache(map, base);
+        const bool ready = patched == Raven2PatchResult::Ready;
+        finishRaven2Map(*state, ready);
+
+        auto& nred = NRed::singleton();
+        if (ready) {
+            __atomic_store_n(&raven2VerifiedCacheBase, base, __ATOMIC_RELEASE);
+            nred.setProp32("NRedVCNUserApplied", kPrivateMediaSiteCount);
+            nred.setProp32("NRedRaven2PrivateCacheReady", 1);
+            if (UserPatches::singleton().usesPrivateMetal()) {
+                nred.setProp32("NRedRaven2PrivateMetalApplied", kPrivateMetalSiteCount);
+                nred.setProp32("NRedMTLHwInfoApplied", 3);
+                nred.setProp32("NRedLegacyBlendApplied", 1);
+            }
+        }
+        return patched == Raven2PatchResult::RestoreFailed ? EFAULT : result;
+    }
+
+    void wrapRaven2MapDestroy(const vm_map_t map)
+    {
+        IOLockLock(raven2MapLock);
+        for (auto& state : raven2Maps) {
+            if (state.map == map) {
+                __atomic_store_n(&state.readyMap, nullptr, __ATOMIC_RELEASE);
+                state.map = nullptr;
+                break;
+            }
+        }
+        IOLockUnlock(raven2MapLock);
+        raven2OriginalMapDestroy(map);
+    }
+} // namespace
+
+bool UserPatches::installRaven2PrivatePatcher(KernelPatcher& patcher)
+{
+    raven2GetTaskMap = reinterpret_cast<Raven2GetTaskMap>(patcher.solveSymbol(KernelPatcher::KernelID, "_get_task_map"));
+    raven2QueryRegion = reinterpret_cast<UserPatchMemory::RegionQuery>(
+        patcher.solveSymbol(KernelPatcher::KernelID, "_mach_vm_region_recurse"));
+    raven2CopyIn = reinterpret_cast<Raven2CopyIn>(patcher.solveSymbol(KernelPatcher::KernelID, "_copyin"));
+    raven2CopyOut = reinterpret_cast<Raven2CopyOut>(patcher.solveSymbol(KernelPatcher::KernelID, "_copyout"));
+    if (!raven2GetTaskMap || !raven2QueryRegion || !raven2CopyIn || !raven2CopyOut) {
+        patcher.clearError();
+        return false;
+    }
+
+    raven2MapLock = IOLockAlloc();
+    if (raven2MapLock == nullptr) { return false; }
+
+    KernelPatcher::RouteRequest routes[] = {
+        {"_vm_map_destroy", wrapRaven2MapDestroy, raven2OriginalMapDestroy},
+        {"_shared_region_check_np", wrapRaven2SharedRegionCheck, raven2OriginalSharedRegionCheck},
+    };
+    if (!patcher.routeMultiple(KernelPatcher::KernelID, routes, arrsize(routes))) {
+        patcher.clearError();
+        return false;
+    }
+    NRed::singleton().setProp32("NRedRaven2PrivateCachePatcher", 1);
+    return true;
+}
+
+bool UserPatches::raven2MediaPagesReady() const
+{
+    if (raven2GetTaskMap == nullptr) { return false; }
+    const auto map = raven2CurrentMap();
+    if (map == nullptr) { return false; }
+
+    // The current task holds the map alive. Map destruction clears readyMap before
+    // the address can be reused. This lookup must be safe under the accelerator lock.
+    for (const auto& state : raven2Maps) {
+        if (__atomic_load_n(&state.readyMap, __ATOMIC_ACQUIRE) == map) { return true; }
+    }
+    return false;
+}
+
+bool UserPatches::prepareRaven2MediaPages() const
+{
+    if (raven2MapLock == nullptr) { return false; }
+    if (raven2MediaPagesReady()) { return true; }
+    const auto map = raven2CurrentMap();
+    if (map == nullptr) { return false; }
+    // A child can inherit already private pages without running dyld startup.
+    // Verify them before the native context creation entry point enters lock_busy.
+    const auto base = __atomic_load_n(&raven2VerifiedCacheBase, __ATOMIC_ACQUIRE);
+    if (base == 0) { return false; }
+    auto* const state = reserveRaven2Map(map);
+    if (state == nullptr) { return raven2MediaPagesReady(); }
+    const bool ready = patchRaven2PrivateCache(map, base, true) == Raven2PatchResult::Ready;
+    finishRaven2Map(*state, ready);
+    return ready;
+}
+
 void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOffset, void* const vnode)
 {
     if (data == nullptr || vnode == nullptr) {
@@ -906,7 +1301,7 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     // Note: _cs_validate_page is invoked by XNU only once per physical page when the page enters the
     // global shared-cache vm_object. Do not gate on per-process identity (e.g. WindowServer or BootCache)
     // or accelerator start timing, as skipping a page during its first fault caches it unpatched globally.
-    if ((isVADriver || isSharedCache) && this->vdaEnabled) {
+    if ((isVADriver || isSharedCache) && this->vdaEnabled && !this->privateMedia) {
         this->applyVdaSignatureList(vnodeKind, pageOffset, bytes, this->vdaSignatures, this->vdaSignatureCount,
                                     this->vdaSignatureApplied, kMaxVDASignatures, "VDA");
 
@@ -926,7 +1321,8 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     }
 
     // AppleGVA Dynamic Resolver path (embedded in dyld_shared_cache or standalone AppleGVA bundle)
-    if ((isAppleGVA || isSharedCache) && this->vdaEnabled && this->gvaSignature != nullptr &&
+    if ((isAppleGVA || isSharedCache) && this->vdaEnabled && !this->privateMedia
+        && this->gvaSignature != nullptr &&
         this->gvaSignatureApplied < this->gvaSignature->count) {
         {
             size_t matchOffset = 0;
@@ -1017,7 +1413,7 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
                 NRed::singleton().setProp32("NRedGLResolverApplied", glCount);
             }
         }
-    } else if (isSharedCache) {
+    } else if (isSharedCache && !this->usesPrivateMetal()) {
         // Gate 2.5: Metal HwInfo patch in dyld shared cache.
         // AMDRadeonX5000MTLDriver lives inside dyld shared cache. We must patch
         // gfx9_HwInfoInitData so numShaderEngines is 1 instead of 4, preventing

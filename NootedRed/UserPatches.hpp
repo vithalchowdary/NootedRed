@@ -151,6 +151,10 @@ public:
     // profile are known (it must run before user processes validate pages).
     void processPatcher(KernelPatcher& patcher);
     bool raven2EncoderPagesReady(bool hevc) const;
+    bool usesPrivateMedia() const { return this->privateMedia; }
+    bool usesPrivateMetal() const { return this->privateMedia && this->resolverEnabled; }
+    bool prepareRaven2MediaPages() const;
+    bool raven2MediaPagesReady() const;
 
     // True when VDA user-space patches are enabled and the page hook is installed.
     bool mediaSupported() const { return this->vdaEnabled && this->nativeBackendReady; }
@@ -214,6 +218,8 @@ private:
     mach_vm_address_t orgCsValidatePage{0};
     mach_vm_address_t orgCsValidateRange{0};
 
+    bool privateMedia{false};
+    bool installRaven2PrivatePatcher(KernelPatcher& patcher);
     auto installNativePagePatcher(KernelPatcher& patcher) -> bool;
     void applyVdaSignatureList(VnodeKind vnodeKind, UInt64 pageOffset, const UInt8* bytes,
                                const SignaturePatch* sigs, size_t sigCount, size_t* appliedCounts,
